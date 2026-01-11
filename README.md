@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/deivy-ramirez/domain-info-cli/main/
 Luego recarga tu terminal o ejecuta:
 
 source ~/.zshrc
-# o
+o
 source ~/.bashrc
 
 🖥️ Uso básico
