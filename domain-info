@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+export LC_ALL=en_US.UTF-8
+export LANG=en_US.UTF-8
+set -euo pipefail
+
+# =========================
+# Flags
+# =========================
+NO_TRACE=0
+AS_JSON=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --no-trace) NO_TRACE=1; shift || true ;;
+    --json) AS_JSON=1; shift || true ;;
+  esac
+done
+
+# =========================
+# Input
+# =========================
+input="${1:-}"
+if [[ -z "${input:-}" ]]; then
+  echo "Uso: $(basename "$0") [--no-trace] [--json] dominio.com | https://dominio.com/ruta | user@dominio.com"
+  exit 1
+fi
+
+# =========================
+# Dependencies
+# =========================
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Falta dependencia: $1"; exit 2; }; }
+need curl
+need jq
+need dig
+
+have_whois=0
+command -v whois >/dev/null 2>&1 && have_whois=1
+
+# =========================
+# Style
+# =========================
+if [[ -t 1 ]]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; CYAN=$'\033[36m'
+else
+  BOLD=""; DIM=""; RESET=""
+  RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""
+fi
+
+pad() { printf "%-18s" "$1"; }
+kv() { pad "$1"; echo -e "${BOLD}$2${RESET}"; }
+
+print_ns_vertical() {
+  local ns_line="$1"
+  if [[ -z "$ns_line" || "$ns_line" == "N/D" ]]; then
+    kv "NS (DNS):" "N/D"
+    return
+  fi
+
+  echo -e "$(pad "NS (DNS):")${BOLD}$(echo "$ns_line" | awk '{print $1}')${RESET}"
+  local rest
+  rest="$(echo "$ns_line" | awk '{for (i=2;i<=NF;i++) print $i}')"
+  if [[ -n "$rest" ]]; then
+    while IFS= read -r item; do
+      [[ -n "$item" ]] && echo -e "$(pad "")${BOLD}${item}${RESET}"
+    done <<< "$rest"
+  fi
+}
+
+normalize_status() {
+  local s="$1"
+  if [[ -z "$s" || "$s" == "N/D" ]]; then
+    echo "N/D"
+    return
+  fi
+
+  echo "$s" \
+    | tr ',' '\n' \
+    | sed -E 's|.*/epp#||; s|^.*#||; s/[[:space:]]+//g' \
+    | awk 'NF' \
+    | sort -u \
+    | paste -sd',' -
+}
+
+status_to_human() {
+  local s="$1"
+  if [[ -z "$s" || "$s" == "N/D" ]]; then
+    echo "N/D"
+    return
+  fi
+
+  # Si hay hold, no traducir a active
+  if echo "$s" | grep -qiE '(^|,)(clientHold|serverHold)(,|$)'; then
+    echo "$s"
+    return
+  fi
+
+  # ok (EPP) normalmente equivale a "active" para vista humana
+  if echo "$s" | grep -qiE '(^|,)ok(,|$)'; then
+    echo "active"
+    return
+  fi
+
+  echo "$s"
+}
+
+to_ymd() {
+  local s="$1"
+  if [[ "$s" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
+    echo "${s:0:10}"
+  else
+    echo "$s"
+  fi
+}
+
+# =========================
+# Domain normalize
+# =========================
+normalize_domain() {
+  local s="$1"
+  s="${s%/}"
+  s="${s#http://}"
+  s="${s#https://}"
+  s="${s#ftp://}"
+  s="${s#www.}"
+  if [[ "$s" == *"@"* ]]; then
+    s="${s##*@}"
+  fi
+  s="${s%%/*}"
+  s="${s%%:*}"
+  echo "$s"
+}
+
+domain="$(normalize_domain "$input")"
+
+if ! [[ "$domain" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+  echo -e "${RED}Dominio inválido:${RESET} $domain"
+  exit 3
+fi
+
+# =========================
+# DNS NS
+# =========================
+get_ns_dns() {
+  local d="$1"
+  local ns_list=""
+  if [[ "$NO_TRACE" -eq 0 ]]; then
+    ns_list="$(dig +trace NS "$d" 2>/dev/null | awk '/\sNS\s/ {print $NF}' | sed 's/\.$//' | sort -u | tr '\n' ' ')"
+  fi
+  if [[ -z "$ns_list" ]]; then
+    ns_list="$(dig +short NS "$d" 2>/dev/null | sed 's/\.$//' | sort -u | tr '\n' ' ')"
+  fi
+  echo "${ns_list:-N/D}"
+}
+
+tld="${domain##*.}"
+
+# =========================
+# RDAP bootstrap IANA
+# =========================
+bootstrap_json=""
+rdap_base=""
+
+fetch_bootstrap() {
+  if [[ -z "$bootstrap_json" ]]; then
+    bootstrap_json="$(curl -fsSL --connect-timeout 5 --max-time 12 \
+      "https://data.iana.org/rdap/dns.json" 2>/dev/null || true)"
+  fi
+}
+
+rdap_for_tld() {
+  local t="$1"
+  fetch_bootstrap
+  if [[ -z "$bootstrap_json" ]]; then
+    echo ""
+    return
+  fi
+
+  echo "$bootstrap_json" | jq -r --arg t "$t" '
+    .services[]
+    | select(.[0] | index($t))
+    | .[1][0]
+  ' 2>/dev/null | head -n1
+}
+
+rdap_base="$(rdap_for_tld "$tld")"
+
+# =========================
+# Query RDAP
+# =========================
+rdap_json=""
+rdap_ok=0
+
+if [[ -n "$rdap_base" ]]; then
+  [[ "$rdap_base" != */ ]] && rdap_base="${rdap_base}/"
+  rdap_json="$(curl -fsSL --connect-timeout 5 --max-time 15 \
+    "${rdap_base}domain/${domain}" 2>/dev/null || true)"
+  if [[ -n "$rdap_json" ]]; then
+    rdap_ok=1
+  fi
+fi
+
+rdap_val() { echo "$rdap_json" | jq -r "$1" 2>/dev/null; }
+
+registered=""
+expires=""
+status=""
+registrar=""
+handle=""
+
+if [[ "$rdap_ok" -eq 1 ]]; then
+  registered="$(rdap_val '.events[]? | select(.eventAction=="registration") | .eventDate' | head -n1)"
+  expires="$(rdap_val '.events[]? | select(.eventAction=="expiration") | .eventDate' | head -n1)"
+  status="$(rdap_val '.status[]?' | tr '\n' ',' | sed 's/,$//' )"
+  handle="$(rdap_val '.handle // empty')"
+
+  registrar="$(echo "$rdap_json" | jq -r '
+    (.entities[]? | select(.roles? and (.roles | index("registrar"))) | .vcardArray[1][]? | select(.[0]=="fn") | .[3]) // empty
+  ' 2>/dev/null | head -n1)"
+
+  if [[ -z "$registrar" ]]; then
+    registrar="$(echo "$rdap_json" | jq -r '
+      (.entities[]? | select(.roles? and (.roles | index("registrar"))) | .handle) // empty
+    ' 2>/dev/null | head -n1)"
+  fi
+fi
+
+# =========================
+# WHOIS fallback (sanitized)
+# =========================
+whois_raw=""
+if [[ "$rdap_ok" -eq 0 || -z "$expires" || -z "$registered" || -z "$registrar" ]]; then
+  if [[ "$have_whois" -eq 1 ]]; then
+    whois_raw="$(whois "$domain" 2>/dev/null | iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null || true)"
+  fi
+fi
+
+parse_whois_date() {
+  local key_regex="$1"
+  echo "$whois_raw" | awk -v IGNORECASE=1 -v r="$key_regex" '
+    $0 ~ r {
+      sub(/^[^:]*:[[:space:]]*/, "", $0);  # quita SOLO hasta el primer :
+      gsub(/\r/, "", $0);
+      print $0;
+      exit
+    }
+  '
+}
+
+if [[ -z "$registered" && -n "$whois_raw" ]]; then
+  registered="$(parse_whois_date '^(Creation Date|Created On|Created|Domain Registration Date)')"
+fi
+
+if [[ -z "$expires" && -n "$whois_raw" ]]; then
+  expires="$(parse_whois_date '^(Registry Expiry Date|Registrar Registration Expiration Date|Expiration Date|Expiry Date|paid-till)')"
+fi
+
+if [[ -z "$registrar" && -n "$whois_raw" ]]; then
+  registrar="$(echo "$whois_raw" | awk -v IGNORECASE=1 '
+    $0 ~ /^Registrar:\s*/ {sub(/.*:\s*/, "", $0); print $0; exit}
+  ' | sed 's/\r//')"
+fi
+
+if [[ -z "$status" && -n "$whois_raw" ]]; then
+  status="$(echo "$whois_raw" | awk -v IGNORECASE=1 '
+    $0 ~ /^Status:\s*/ {sub(/.*:\s*/, "", $0); print $0}
+    $0 ~ /^Domain Status:\s*/ {sub(/.*:\s*/, "", $0); print $0}
+  ' | sed 's/\r//' | tr '\n' ',' | sed 's/,$//')"
+fi
+
+# =========================
+# NS
+# =========================
+ns="$(get_ns_dns "$domain")"
+
+# =========================
+# Defaults + normalize
+# =========================
+registered="${registered:-N/D}"
+expires="${expires:-N/D}"
+status="${status:-N/D}"
+registrar="${registrar:-N/D}"
+handle="${handle:-N/D}"
+rdap_base="${rdap_base:-N/D}"
+
+registered="$(to_ymd "$registered")"
+expires="$(to_ymd "$expires")"
+
+status="$(normalize_status "$status")"
+status="$(status_to_human "$status")"
+
+# =========================
+# JSON output
+# =========================
+if [[ "$AS_JSON" -eq 1 ]]; then
+  jq -n \
+    --arg domain "$domain" \
+    --arg tld "$tld" \
+    --arg ns "$ns" \
+    --arg registered "$registered" \
+    --arg expires "$expires" \
+    --arg status "$status" \
+    --arg registrar "$registrar" \
+    --arg rdap_base "$rdap_base" \
+    --arg handle "$handle" \
+    '{
+      domain:$domain,
+      tld:$tld,
+      ns:($ns | split(" ") | map(select(length>0))),
+      registered:$registered,
+      expires:$expires,
+      status:($status | split(",") | map(select(length>0))),
+      registrar:$registrar,
+      rdap_base:$rdap_base,
+      rdap_handle:$handle
+    }'
+  exit 0
+fi
+
+# =========================
+# Pretty output
+# =========================
+echo -e "${BOLD}${CYAN}Domain Info${RESET}  ${DIM}(${domain})${RESET}"
+echo -e "${DIM}--------------------------------------------------${RESET}"
+kv "Dominio:" "$domain"
+kv "TLD:" "$tld"
+print_ns_vertical "$ns"
+kv "Registrado:" "$registered"
+kv "Expira:" "$expires"
+
+if [[ "$status" =~ (active|ok|clientTransferProhibited|serverTransferProhibited|clientHold|serverHold) ]]; then
+  kv "Estado:" "${YELLOW}${status}${RESET}"
+else
+  kv "Estado:" "$status"
+fi
+
+kv "Proveedor:" "$registrar"
+kv "RDAP base:" "$rdap_base"
+kv "RDAP handle:" "$handle"
+
+if [[ "$rdap_ok" -eq 1 ]]; then
+  echo -e "${DIM}Fuente: RDAP + DNS (fallback WHOIS si faltó algo).${RESET}"
+else
+  echo -e "${DIM}Fuente: DNS + WHOIS (RDAP no disponible para este TLD o falló).${RESET}"
+fi
