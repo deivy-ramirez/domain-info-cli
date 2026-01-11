@@ -9,7 +9,6 @@ A diferencia del comando `whois`, esta herramienta:
 - Nunca se rompe por errores de formato o acentos
 - Presenta la información de forma clara y legible
 
----
 
 ## 🚀 Características
 
@@ -22,7 +21,6 @@ A diferencia del comando `whois`, esta herramienta:
 - Modo `--json` para integración con otros scripts
 - Compatible con **macOS y Linux**
 
----
 
 ## 📦 Requisitos
 
@@ -84,4 +82,5 @@ jq: command not found
   brew install jq
 
 👨‍💻 Autor
+
 **Deivy Steven Ramirez Molina**
