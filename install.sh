@@ -14,7 +14,7 @@ RAW_BASE="https://raw.githubusercontent.com/deivy-ramirez/domain-info-cli/main"
 # =========================
 # Rutas
 # =========================
-TARGET_DIR="${HOME}/.local/bin"
+TARGET_DIR="${HOME}/bin"
 TARGET_PATH="${TARGET_DIR}/${BIN_NAME}"
 
 # =========================
@@ -44,7 +44,7 @@ detect_shell_rc() {
 
 ensure_path_line() {
   local rc_file="$1"
-  local line='export PATH="$HOME/.local/bin:$PATH"'
+  local line='export PATH="$HOME/bin:$PATH"'
 
   # Crear archivo si no existe
   [[ -f "$rc_file" ]] || touch "$rc_file"
